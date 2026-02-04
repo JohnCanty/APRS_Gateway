@@ -25,6 +25,15 @@ APRS_SERVER = os.environ.get("APRS_SERVER", "rotate.aprs2.net")
 APRS_PORT = int(os.environ.get("APRS_PORT", "14580"))
 LOG_SERVER = os.environ.get("LOG_SERVER", None)  # Format: "ip:port" or None
 
+# --- FALLBACK SERVERS ---
+FALLBACK_SERVERS_ENV = os.environ.get(
+    "FALLBACK_SERVERS", 
+    "rotate.aprs2.net, noam.aprs2.net, euro.aprs2.net"
+    )
+
+# --- COMMON PORTS ---
+COMMON_PORTS = [14580, 14581, 10152]
+
 # --- LOGGING SETUP ---
 logger = logging.getLogger("APRS-Gateway")
 logger.setLevel(logging.INFO)
@@ -123,49 +132,75 @@ def set_security_headers(response):
     response.headers.setdefault("Content-Security-Policy", "default-src 'self';")
     return response
 
+# --- PARSE FALLBACK BITS ---
+def _parse_fallback_hosts(env_value: str):
+    return [h.strip() for h in env_value.split(",") if h.strip()]
+
+FALLBACK_HOSTS = _parse_fallback_hosts(FALLBACK_SERVERS_ENV)
+
+# --- APRS-IS SENDING LOGIC ---
 def send_to_aprs_is(source_call, passcode, dest_call, message_text):
-    """Handles the TCP connection and packet injection."""
-    # APRS Message Format: SOURCE>APRS,TCPIP*::DESTINATION:MESSAGE
-    # Destination callsign field in the message body must be 9 chars (padded with spaces)
+    """Try connecting to configured APRS-IS endpoint, then fallbacks if needed.
+
+    Returns (success: bool, status_message: str)
+    """
+    # Prepare packet (correct APRS message format: double-colon before dest)
     dest_padded = dest_call.ljust(CALLSIGN_MAX_LEN)
     packet = f"{source_call}>APRS,TCPIP*::{dest_padded}:{message_text}\n"
-    
-    try:
-        # Create socket and connect
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(10)
-        s.connect((APRS_SERVER, APRS_PORT))
-        
-        # Read server banner
-        banner = s.recv(1024).decode('utf-8', errors='ignore')
-        
-        # Login
-        login_str = f"user {source_call} pass {passcode} vers LocalGateway 1.0\n"
-        s.sendall(login_str.encode('utf-8'))
-        
-        # Read login response
-        response = s.recv(1024).decode('utf-8', errors='ignore')
-        
-        # Check if login was successful
-        if "unverified" in response.lower():
-            s.close()
-            logger.warning(f"Failed login attempt from {source_call}")
-            return False, "Login failed: Invalid passcode or callsign"
-        
-        # Send the packet
-        s.sendall(packet.encode('utf-8'))
-        s.close()
-        
-        # Log successful message
-        logger.info(f"Message sent: {source_call} -> {dest_call}: {message_text}")
-        
-        return True, f"Message sent successfully to {dest_call}!"
-    except socket.timeout:
-        logger.error(f"Connection timeout for {source_call} -> {dest_call}")
-        return False, "Connection timeout - check your network"
-    except Exception as e:
-        logger.error(f"Error sending message from {source_call} to {dest_call}: {str(e)}")
-        return False, f"Error: {str(e)}"
+
+    # Build list of (host, port) tuples to try
+    hosts_to_try = [APRS_SERVER] + [h for h in FALLBACK_HOSTS if h != APRS_SERVER]
+    last_err = None
+
+    for host in hosts_to_try:
+        ports_to_try = [APRS_PORT] + [p for p in COMMON_PORTS if p != APRS_PORT]
+        for port in ports_to_try:
+            logger.info("Attempting APRS-IS connection to %s:%d", host, port)
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(10)
+                s.connect((host, port))
+
+                # Read server banner (optional)
+                try:
+                    banner = s.recv(1024).decode("utf-8", errors="ignore")
+                except Exception:
+                    banner = ""
+
+                # Login
+                login_str = f"user {source_call} pass {passcode} vers LocalGateway 1.0\n"
+                s.sendall(login_str.encode("utf-8"))
+
+                # Read login response
+                try:
+                    response = s.recv(1024).decode("utf-8", errors="ignore")
+                except Exception as e:
+                    s.close()
+                    logger.warning("No login response from %s:%d: %s", host, port, e)
+                    last_err = f"No login response from {host}:{port}: {e}"
+                    continue
+
+                if "unverified" in response.lower() or "invalid" in response.lower():
+                    s.close()
+                    logger.warning("Login rejected by %s:%d for %s", host, port, source_call)
+                    return False, f"Login failed at {host}:{port} - invalid passcode or callsign"
+
+                # Send packet
+                s.sendall(packet.encode("utf-8"))
+                s.close()
+
+                logger.info("Message sent via %s:%d - %s -> %s", host, port, source_call, dest_call)
+                return True, f"Message sent successfully via {host}:{port} to {dest_call}!"
+            except socket.timeout:
+                logger.error("Connection timeout to %s:%d", host, port)
+                last_err = f"Connection timeout to {host}:{port}"
+            except Exception as e:
+                logger.error("Error connecting to %s:%d - %s", host, port, e)
+                last_err = f"Error connecting to {host}:{port}: {e}"
+
+    # --- NO HOPE LEFT ---
+    logger.error("All APRS-IS connection attempts failed. Last error: %s", last_err)
+    return False, f"All APRS-IS connection attempts failed. Last error: {last_err}"
 
 def validate_callsign(raw: str) -> str | None:
     """
