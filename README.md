@@ -12,6 +12,10 @@ A secure-ish, lightweight web-based gateway to send APRS messages via the APRS-I
 - **Logging**: Console logging and remote Syslog support with user IP tracking.
 - **Public IP Ready**: Runs via Gunicorn as a systemd service.
 
+Sorry about the lack of commits on this, when I first started it I was just beating up a small script in vi and later decided to make it robust ish so the commits are basically a result of 
+```
+cat /opt/aprs-gateway/aprs_gateway.py
+```
 ---
 
 ## 1. System Preparation (Debian 13 LXC)
